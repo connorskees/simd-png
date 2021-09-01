@@ -1,0 +1,4 @@
+/target
+Cargo.lock
+*.png
+!Periodic_table_large.png
