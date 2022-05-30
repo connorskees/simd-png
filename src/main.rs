@@ -1,5 +1,4 @@
-#![feature(const_generics)]
-#![feature(const_evaluatable_checked)]
+#![feature(stdsimd)]
 #![allow(incomplete_features)]
 
 use std::{
@@ -11,6 +10,11 @@ use std::{
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
+mod deflate;
 
 #[derive(Debug)]
 struct PngReader {
@@ -87,6 +91,7 @@ struct PngDecoder {
 }
 
 fn sub(raw_row: &[u8], decoded_row: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         unsafe { sub_avx(raw_row, decoded_row) };
         return;
@@ -103,6 +108,7 @@ fn sub(raw_row: &[u8], decoded_row: &mut [u8]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn up_avx(prev: &[u8], raw_row: &[u8], decoded_row: &mut [u8]) {
     debug_assert!(is_x86_feature_detected!("avx2"));
 
@@ -130,8 +136,14 @@ fn up_avx(prev: &[u8], raw_row: &[u8], decoded_row: &mut [u8]) {
 }
 
 fn up(prev: &[u8], raw_row: &[u8], decoded_row: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         up_avx(prev, raw_row, decoded_row);
+        return;
+    }
+
+    if prev.is_empty() {
+        decoded_row[..].copy_from_slice(raw_row);
         return;
     }
 
@@ -199,10 +211,11 @@ fn paeth(prev: &[u8], raw_row: &[u8], decoded_row: &mut [u8]) {
 
 impl PngDecoder {
     pub fn new(header_chunk: HeaderChunk, buffer: &[u8]) -> Self {
-        let mut decoded_buffer = Vec::new();
-        flate2::read::ZlibDecoder::new(buffer)
-            .read_to_end(&mut decoded_buffer)
-            .unwrap();
+        let mut decoded_buffer = deflate::decode(buffer);
+
+        // flate2::read::ZlibDecoder::new(buffer)
+        //     .read_to_end(&mut decoded_buffer)
+        //     .unwrap();
 
         Self {
             header_chunk,
@@ -231,9 +244,12 @@ impl PngDecoder {
             let decoded_row = &mut decoded_row[..(bytes_per_row - 1)];
 
             let prev = &prev[(prev.len().saturating_sub(bytes_per_row - 1))..];
+            // dbg!(i, prev.len(), raw_row.len(), decoded_row.len());
 
-            debug_assert_eq!(prev.len(), raw_row.len());
-            debug_assert_eq!(prev.len(), decoded_row.len());
+            if i != 0 {
+                debug_assert_eq!(prev.len(), raw_row.len());
+                debug_assert_eq!(prev.len(), decoded_row.len());
+            }
 
             *counts.entry(start).or_insert(0) += 1;
 
@@ -250,7 +266,7 @@ impl PngDecoder {
             }
         }
 
-        dbg!(counts);
+        // dbg!(&decoded_buffer);
 
         Bitmap {
             width: self.header_chunk.width,
@@ -421,23 +437,22 @@ fn main() {
 
     window.limit_update_rate(Some(std::time::Duration::from_millis(1000)));
 
-    window
-        .update_with_buffer(
-            &bitmap
-                .buffer
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes([b[2], b[1], b[0], 0]))
-                .collect::<Vec<u32>>(),
-            bitmap.width as usize,
-            bitmap.height as usize,
-        )
-        .unwrap();
-
     while window.is_open() {
-        window.update();
+        window
+            .update_with_buffer(
+                &bitmap
+                    .buffer
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes([b[2], b[1], b[0], 0]))
+                    .collect::<Vec<u32>>(),
+                bitmap.width as usize,
+                bitmap.height as usize,
+            )
+            .unwrap();
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn sub_avx(raw_row: &[u8], decoded_row: &mut [u8]) {
     let off = raw_row.len() % 32;
 
