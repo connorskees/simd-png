@@ -1,321 +1,32 @@
 #![feature(stdsimd)]
+#![feature(test)]
+#![allow(warnings)]
 #![allow(incomplete_features)]
+
+extern crate test;
 
 use std::{
     collections::HashMap,
     fmt::{self, Write},
+    hint::black_box,
     io::Read,
     usize,
 };
 
-use filter::average_avx;
+pub use crate::filter::{average, paeth, sub, up, up_avx, up_unsafe};
+use crate::filter::{
+    sub_avx, sub_avx_attempt_2, sub_avx_attempt_3, sub_avx_attempt_4, sub_avx_attempt_5, sub_sse2,
+    sub_sse2_ported,
+};
 
-use crate::filter::{up, sub, average, paeth};
-
-mod filter;
-
-
-#[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
+#[cfg(feature = "png")]
+use crate::png::*;
 
 mod deflate;
-
-#[derive(Debug)]
-struct PngReader {
-    buffer: memmap::Mmap,
-    cursor: usize,
-}
-
-#[derive(Debug)]
-struct ChunkHeader {
-    name: ChunkName,
-    length: u32,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ChunkName([u8; 4]);
-
-impl ChunkName {
-    const IHDR: Self = ChunkName(*b"IHDR");
-    const IDAT: Self = ChunkName(*b"IDAT");
-
-    pub fn is_idat(&self) -> bool {
-        self == &Self::IDAT
-    }
-}
-
-impl fmt::Display for ChunkName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_char(self.0[0] as char)?;
-        f.write_char(self.0[1] as char)?;
-        f.write_char(self.0[2] as char)?;
-        f.write_char(self.0[3] as char)?;
-
-        Ok(())
-    }
-}
-
-/// The PNG header. In ascii, it can be represented as \x{89}PNG\r\n\x{1a}\n
-pub const HEADER: [u8; 8] = [137u8, 80, 78, 71, 13, 10, 26, 10];
+mod filter;
+mod png;
 
 pub const BYTES_PER_PIXEL: usize = 4;
-
-#[derive(Debug)]
-struct HeaderChunk {
-    width: u32,
-    height: u32,
-    bit_depth: u8,
-    color_type: u8,
-    compression_type: u8,
-    filter_method: u8,
-    interlacing_method: u8,
-}
-
-impl HeaderChunk {
-    const NAME: ChunkName = ChunkName::IHDR;
-
-    /// We only support a subset of PNG features. Ensure that this file only includes
-    /// the features we support
-    fn validate(&self) {
-        assert_eq!(self.bit_depth, 8);
-        assert_eq!(self.compression_type, 0);
-        // rgba
-        assert_eq!(self.color_type, 6);
-        // adaptive
-        assert_eq!(self.filter_method, 0);
-        // no interlacing
-        assert_eq!(self.interlacing_method, 0);
-    }
-}
-
-#[derive(Debug)]
-struct PngDecoder {
-    header_chunk: HeaderChunk,
-    buffer: Vec<u8>,
-}
-
-impl PngDecoder {
-    pub fn new(header_chunk: HeaderChunk, buffer: &[u8]) -> Self {
-        let mut decoded_buffer = Vec::new();
-
-        flate2::read::ZlibDecoder::new(buffer)
-            .read_to_end(&mut decoded_buffer)
-            .unwrap();
-
-        Self {
-            header_chunk,
-            buffer: decoded_buffer,
-        }
-    }
-
-    pub fn decode(self) -> Bitmap {
-        let width = self.header_chunk.width as usize;
-        let height = self.header_chunk.height as usize;
-
-        let mut decoded_buffer = vec![0; self.buffer.len() - height as usize];
-
-        let bytes_per_row = 1 + width * BYTES_PER_PIXEL;
-
-        let mut counts = HashMap::new();
-
-        for i in 0..height {
-            let raw_row_start = (i * bytes_per_row) as usize;
-            let decoded_row_start = (i * (bytes_per_row - 1)) as usize;
-            let start = self.buffer[raw_row_start];
-            let raw_row = &self.buffer[(raw_row_start + 1)..(raw_row_start + bytes_per_row)];
-
-            let (prev, decoded_row) = decoded_buffer.split_at_mut(decoded_row_start);
-
-            let decoded_row = &mut decoded_row[..(bytes_per_row - 1)];
-
-            let prev = &prev[(prev.len().saturating_sub(bytes_per_row - 1))..];
-
-            if i != 0 {
-                debug_assert_eq!(prev.len(), raw_row.len());
-                debug_assert_eq!(prev.len(), decoded_row.len());
-            }
-
-            *counts.entry(start).or_insert(0) += 1;
-
-            match start {
-                0 => {
-                    // nop
-                }
-                1 => sub(raw_row, decoded_row),
-                2 => up(prev, raw_row, decoded_row),
-                3 => average_avx(prev, raw_row, decoded_row),
-                4 => paeth(prev, raw_row, decoded_row),
-                _ => unimplemented!("{}", start),
-            }
-        }
-
-        Bitmap {
-            width: self.header_chunk.width,
-            height: self.header_chunk.height,
-            buffer: decoded_buffer,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Bitmap {
-    width: u32,
-    height: u32,
-    buffer: Vec<u8>,
-}
-
-impl PngReader {
-    pub fn new(buffer: memmap::Mmap) -> Self {
-        Self { buffer, cursor: 0 }
-    }
-
-    pub fn parse(mut self) -> Bitmap {
-        self.read_magic();
-
-        let header = self.read_header_chunk();
-        let mut pixel_buffer = Vec::new();
-
-        while !self.at_eof() {
-            if let Some(buffer) = self.read_idat_chunk() {
-                pixel_buffer.extend_from_slice(buffer);
-                self.skip_chunk_end();
-            }
-        }
-
-        let decoder = PngDecoder::new(header, &pixel_buffer);
-
-        decoder.decode()
-    }
-
-    fn at_eof(&self) -> bool {
-        self.cursor >= self.buffer.len()
-    }
-
-    fn read_idat_chunk(&mut self) -> Option<&[u8]> {
-        let header = self.read_chunk_header();
-
-        if !header.name.is_idat() {
-            self.skip_chunk(header.length);
-            return None;
-        }
-
-        let body = self.read_buffer(header.length as usize);
-
-        Some(body)
-    }
-
-    fn skip_chunk(&mut self, len: u32) {
-        self.cursor += len as usize;
-        self.skip_chunk_end();
-    }
-
-    fn skip_chunk_end(&mut self) {
-        self.cursor += 4;
-    }
-
-    fn read_chunk_header(&mut self) -> ChunkHeader {
-        let length = self.read_u32_be().unwrap();
-        let name = self.read_chunk_name().unwrap();
-
-        ChunkHeader { name, length }
-    }
-
-    fn read_magic(&mut self) {
-        let header = self.read_buffer_const::<8>();
-
-        debug_assert_eq!(header, HEADER);
-    }
-
-    fn read_header_chunk(&mut self) -> HeaderChunk {
-        let chunk_header = self.read_chunk_header();
-
-        debug_assert_eq!(chunk_header.name, HeaderChunk::NAME);
-        debug_assert_eq!(chunk_header.length, 13);
-
-        let width = self.read_u32_be().unwrap();
-        let height = self.read_u32_be().unwrap();
-        let bit_depth = self.next_byte().unwrap();
-        let color_type = self.next_byte().unwrap();
-        let compression_type = self.next_byte().unwrap();
-        let filter_method = self.next_byte().unwrap();
-        let interlacing_method = self.next_byte().unwrap();
-
-        self.skip_chunk_end();
-
-        let header_chunk = HeaderChunk {
-            width,
-            height,
-            bit_depth,
-            color_type,
-            compression_type,
-            filter_method,
-            interlacing_method,
-        };
-
-        header_chunk.validate();
-
-        header_chunk
-    }
-
-    fn read_u32_be(&mut self) -> Option<u32> {
-        let b1 = self.next_byte()?;
-        let b2 = self.next_byte()?;
-        let b3 = self.next_byte()?;
-        let b4 = self.next_byte()?;
-
-        Some(u32::from_be_bytes([b1, b2, b3, b4]))
-    }
-
-    fn read_buffer(&mut self, len: usize) -> &[u8] {
-        let start = self.cursor;
-        self.cursor += len;
-
-        debug_assert!(self.cursor <= self.buffer.len());
-
-        &self.buffer[start..self.cursor]
-    }
-
-    fn read_buffer_const<const C: usize>(&mut self) -> &[u8] {
-        let start = self.cursor;
-        self.cursor += C;
-
-        debug_assert!(self.cursor <= self.buffer.len());
-
-        &self.buffer[start..self.cursor]
-    }
-
-    fn read_chunk_name(&mut self) -> Option<ChunkName> {
-        let b1 = self.next_byte()?;
-        let b2 = self.next_byte()?;
-        let b3 = self.next_byte()?;
-        let b4 = self.next_byte()?;
-
-        Some(ChunkName([b1, b2, b3, b4]))
-    }
-
-    fn next_byte(&mut self) -> Option<u8> {
-        self.buffer.get(self.cursor).cloned().map(|b| {
-            self.cursor += 1;
-            b
-        })
-    }
-}
-
-fn decode<const N: usize>(up: &[u8; N], row: &[u8; N]) -> [u8; N] {
-    let mut decoded_row = [0; N];
-
-    average(up, row, &mut decoded_row);
-
-    return decoded_row;
-}
-
-fn decode_avx<const N: usize>(up: &[u8], row: &[u8]) -> [u8; N] {
-    let mut decoded_row = [0; N];
-
-    average_avx(up, row, &mut decoded_row);
-
-    return decoded_row;
-}
 
 // up = [0,0,0,0, 244, 132, 17, 42, 64]
 // row = [0,0,0,0, 221, 4, 99, 12, 128]
@@ -335,34 +46,343 @@ fn main() {
 
     // assert_eq!(reg, avx);
 
-    let file = std::fs::File::open("Periodic_table_large.png").unwrap();
-    let mmap = unsafe { memmap::MmapOptions::new().map(&file) }.unwrap();
-    let decoder = PngReader::new(mmap);
+    // ---
+    // let raw_row = Box::new([5; 32 * 32]);
+    let raw_row = Box::new([3, 5, 6, 7, 54, 52, 75, 85, 99, 38, 12, 14, 7, 0, 0, 255]); //(0..16).collect::<Vec<_>>().into_boxed_slice();//Box::new([10; 32 * 32]);
+    let mut decoded_row = vec![0; raw_row.len()].into_boxed_slice();
 
-    let bitmap = decoder.parse();
+    // let start = std::time::Instant::now();
+    sub(&*raw_row, &mut *decoded_row);
+    // let end = start.elapsed();
 
-    let mut window = minifb::Window::new(
-        "Image",
-        bitmap.width as usize,
-        bitmap.height as usize,
-        minifb::WindowOptions::default(),
-    )
-    .unwrap();
+    // black_box(decoded_row);
 
-    window.limit_update_rate(Some(std::time::Duration::from_millis(1000)));
+    // println!("{:?}", end);
 
-    while window.is_open() {
-        window
-            .update_with_buffer(
-                &bitmap
-                    .buffer
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes([b[2], b[1], b[0], 0]))
-                    .collect::<Vec<u32>>(),
-                bitmap.width as usize,
-                bitmap.height as usize,
-            )
-            .unwrap();
+    // let raw_row = Box::new([5; 32 * 32]);
+    let raw_row = Box::new([3, 5, 6, 7, 54, 52, 75, 85, 99, 38, 12, 14, 7, 0, 0, 255]); //(0..16).collect::<Vec<_>>().into_boxed_slice();//Box::new([10; 32 * 32]);
+    let mut decoded_row2 = vec![0; raw_row.len()].into_boxed_slice();
+
+    // let start = std::time::Instant::now();
+    unsafe { sub_sse2_ported(&*raw_row, &mut *decoded_row2) };
+    // let end = start.elapsed();
+
+    assert_eq!(decoded_row, decoded_row2);
+
+    // ---
+    // black_box(decoded_row);
+
+    // println!("{:?}", end);
+
+    // let prev = Box::new([5; 1_000_000]);
+    // let raw_row = Box::new([10; 1_000_000]);
+    // let mut decoded_row = Box::new([0; 1_000_000]);
+
+    // let start = std::time::Instant::now();
+    // unsafe { up_unsafe(&*prev, &*raw_row, &mut *decoded_row) };
+    // let end = start.elapsed();
+
+    // black_box(decoded_row);
+
+    // println!("{:?}", end);
+
+    // let prev = Box::new([5; 1_000_000]);
+    // let raw_row = Box::new([10; 1_000_000]);
+    // let mut decoded_row = Box::new([0; 1_000_000]);
+
+    // let start = std::time::Instant::now();
+    // up_avx(&*prev, &*raw_row, &mut *decoded_row);
+    // let end = start.elapsed();
+
+    // black_box(decoded_row);
+
+    // println!("{:?}", end);
+
+    // #[cfg(feature = "png")]
+    // {
+    //     let file = std::fs::File::open("Periodic_table_large.png").unwrap();
+    //     let mmap = unsafe { memmap::MmapOptions::new().map(&file) }.unwrap();
+    //     let decoder = PngReader::new(mmap);
+
+    //     let bitmap = decoder.parse();
+    // }
+
+    // let mut window = minifb::Window::new(
+    //     "Image",
+    //     bitmap.width as usize,
+    //     bitmap.height as usize,
+    //     minifb::WindowOptions::default(),
+    // )
+    // .unwrap();
+
+    // window.limit_update_rate(Some(std::time::Duration::from_millis(1000)));
+
+    // while window.is_open() {
+    //     window
+    //         .update_with_buffer(
+    //             &bitmap
+    //                 .buffer
+    //                 .chunks_exact(4)
+    //                 .map(|b| u32::from_le_bytes([b[2], b[1], b[0], 0]))
+    //                 .collect::<Vec<u32>>(),
+    //             bitmap.width as usize,
+    //             bitmap.height as usize,
+    //         )
+    //         .unwrap();
+    // }
+
+    // let file = std::fs::File::open("Periodic_table_large.png").unwrap();
+    // let mmap = unsafe { memmap::MmapOptions::new().map(&file) }.unwrap();
+    // let mut decoder = PngReader::new(mmap);
+
+    // let bitmap = decoder.parse();
+
+    // // let raw_row = Box::new([10; BUFFER_SIZE]);
+    // // let mut decoded_row = Box::new([0; BUFFER_SIZE]);
+
+    // std::hint::black_box(bitmap);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::arch::x86_64::*;
+    use std::convert::TryInto;
+    use test::Bencher;
+
+    use crate::filter::{sub_sse2_ported, sub_sse_prefix_sum_no_extract};
+
+    const BYTES_PER_PIXEL: usize = 4;
+
+    pub fn sub(raw_row: &[u8], decoded_row: &mut [u8]) {
+        for i in 0..BYTES_PER_PIXEL {
+            decoded_row[i] = raw_row[i];
+        }
+
+        for i in BYTES_PER_PIXEL..decoded_row.len() {
+            let left = decoded_row[i - BYTES_PER_PIXEL];
+
+            decoded_row[i] = raw_row[i].wrapping_add(left)
+        }
+    }
+
+    pub unsafe fn sub_no_bound_checks(raw_row: &[u8], decoded_row: &mut [u8]) {
+        for i in 0..BYTES_PER_PIXEL {
+            *decoded_row.get_unchecked_mut(i) = *raw_row.get_unchecked(i);
+        }
+
+        for i in BYTES_PER_PIXEL..decoded_row.len() {
+            let left = *decoded_row.get_unchecked(i - BYTES_PER_PIXEL);
+
+            *decoded_row.get_unchecked_mut(i) = raw_row.get_unchecked(i).wrapping_add(left)
+        }
+    }
+
+    pub unsafe fn baseline_memcpy(raw_row: &[u8], decoded_row: &mut [u8]) {
+        decoded_row
+            .get_unchecked_mut(0..raw_row.len())
+            .copy_from_slice(&*raw_row);
+    }
+
+    unsafe fn load4(x: &[u8; 4]) -> __m128i {
+        let tmp = i32::from_le_bytes(*x);
+        _mm_cvtsi32_si128(tmp)
+    }
+
+    unsafe fn store4(x: &mut [u8; 4], v: __m128i) {
+        let tmp = _mm_cvtsi128_si32(v);
+        x.copy_from_slice(&tmp.to_le_bytes());
+    }
+
+    pub unsafe fn sub_sse2(raw: &[u8], current: &mut [u8]) {
+        let (mut a, mut d) = (_mm_setzero_si128(), _mm_setzero_si128());
+
+        for (raw, out) in raw.chunks_exact(4).zip(current.chunks_exact_mut(4)) {
+            a = d;
+            d = load4(raw.try_into().unwrap());
+            d = _mm_add_epi8(d, a);
+            store4(out.try_into().unwrap(), d);
+        }
+    }
+
+    pub unsafe fn sub_avx(raw_row: &[u8], decoded_row: &mut [u8]) {
+        debug_assert!(is_x86_feature_detected!("avx2"));
+
+        let mut last = 0;
+        let mut x: __m256i;
+
+        let len = raw_row.len();
+        let mut i = 0;
+
+        let offset = len % 32;
+        if offset != 0 {
+            sub_sse2(
+                raw_row.get_unchecked(..offset),
+                decoded_row.get_unchecked_mut(..offset),
+            );
+            last = i32::from_be_bytes([
+                *decoded_row.get_unchecked(offset - 1),
+                *decoded_row.get_unchecked(offset - 2),
+                *decoded_row.get_unchecked(offset - 3),
+                *decoded_row.get_unchecked(offset - 4),
+            ]);
+            i = offset;
+        }
+
+        while len != i {
+            // load 32 bytes from array
+            x = _mm256_loadu_si256(raw_row.get_unchecked(i) as *const _ as *const __m256i);
+
+            // do prefix sum
+            x = _mm256_add_epi8(_mm256_slli_si256::<4>(x), x);
+            x = _mm256_add_epi8(_mm256_slli_si256::<{ 2 * 4 }>(x), x);
+
+            // accumulate for first 16 bytes
+            let b = _mm256_extract_epi32::<3>(x);
+            x = _mm256_add_epi8(_mm256_set_epi32(b, b, b, b, 0, 0, 0, 0), x);
+
+            // accumulate for previous chunk of 16 bytes
+            x = _mm256_add_epi8(_mm256_set1_epi32(last), x);
+
+            // accumulate for last 16 bytes
+            last = _mm256_extract_epi32::<7>(x);
+
+            // write 32 bytes to out array
+            _mm256_storeu_si256(
+                decoded_row.get_unchecked_mut(i) as *mut _ as *mut __m256i,
+                x,
+            );
+
+            i += 32;
+        }
+    }
+
+    pub unsafe fn sub_sse_prefix_sum(raw_row: &[u8], decoded_row: &mut [u8]) {
+        debug_assert!(is_x86_feature_detected!("avx2"));
+
+        let mut last = 0;
+        let mut x: __m128i;
+
+        let len = raw_row.len();
+        let mut i = 0;
+
+        let offset = len % 16;
+        if offset != 0 {
+            sub_sse2(
+                raw_row.get_unchecked(..offset),
+                decoded_row.get_unchecked_mut(..offset),
+            );
+            last = i32::from_be_bytes([
+                *decoded_row.get_unchecked(offset - 1),
+                *decoded_row.get_unchecked(offset - 2),
+                *decoded_row.get_unchecked(offset - 3),
+                *decoded_row.get_unchecked(offset - 4),
+            ]);
+            i = offset;
+        }
+
+        while len != i {
+            // load 16 bytes from array
+            x = _mm_loadu_si128(raw_row.get_unchecked(i) as *const _ as *const __m128i);
+
+            // do prefix sum
+            x = _mm_add_epi8(_mm_slli_si128::<4>(x), x);
+            x = _mm_add_epi8(_mm_slli_si128::<{ 2 * 4 }>(x), x);
+
+            // accumulate for previous chunk of 16 bytes
+            x = _mm_add_epi8(x, _mm_set1_epi32(last));
+
+            last = _mm_extract_epi32::<3>(x);
+
+            // write 16 bytes to out array
+            _mm_storeu_si128(
+                decoded_row.get_unchecked_mut(i) as *mut _ as *mut __m128i,
+                x,
+            );
+
+            i += 16;
+        }
+    }
+
+    const BUFFER_SIZE: usize = 2_usize.pow(20);
+
+    #[bench]
+    fn bench_sub_naive_scalar(b: &mut Bencher) {
+        let raw_row = std::hint::black_box([10; BUFFER_SIZE]);
+        let mut decoded_row = std::hint::black_box([0; BUFFER_SIZE]);
+
+        b.iter(|| sub(&raw_row, &mut decoded_row));
+
+        std::hint::black_box(decoded_row);
+    }
+
+    #[bench]
+    fn bench_sub_no_bound_checks(b: &mut Bencher) {
+        let raw_row = std::hint::black_box([10; BUFFER_SIZE]);
+        let mut decoded_row = std::hint::black_box([0; BUFFER_SIZE]);
+
+        b.iter(|| unsafe { sub_no_bound_checks(&raw_row, &mut decoded_row) });
+
+        std::hint::black_box(decoded_row);
+    }
+
+    #[bench]
+    fn bench_baseline_memcpy(b: &mut Bencher) {
+        let raw_row = std::hint::black_box([10; BUFFER_SIZE]);
+        let mut decoded_row = std::hint::black_box([0; BUFFER_SIZE]);
+
+        b.iter(|| unsafe { baseline_memcpy(&raw_row, &mut decoded_row) });
+
+        std::hint::black_box(decoded_row);
+    }
+
+    #[bench]
+    fn bench_sub_sse2(b: &mut Bencher) {
+        let raw_row = std::hint::black_box([10; BUFFER_SIZE]);
+        let mut decoded_row = std::hint::black_box([0; BUFFER_SIZE]);
+
+        b.iter(|| unsafe { sub_sse2(&raw_row, &mut decoded_row) });
+
+        std::hint::black_box(decoded_row);
+    }
+
+    #[bench]
+    fn bench_sub_avx(b: &mut Bencher) {
+        let raw_row = std::hint::black_box([10; BUFFER_SIZE]);
+        let mut decoded_row = std::hint::black_box([0; BUFFER_SIZE]);
+
+        b.iter(|| unsafe { sub_avx(&raw_row, &mut decoded_row) });
+
+        std::hint::black_box(decoded_row);
+    }
+
+    #[bench]
+    fn bench_sub_sse_prefix_sum(b: &mut Bencher) {
+        let raw_row = std::hint::black_box([10; BUFFER_SIZE]);
+        let mut decoded_row = std::hint::black_box([0; BUFFER_SIZE]);
+
+        b.iter(|| unsafe { sub_sse_prefix_sum(&raw_row, &mut decoded_row) });
+
+        std::hint::black_box(decoded_row);
+    }
+
+    #[bench]
+    fn bench_sub_sse_prefix_sum_no_extract(b: &mut Bencher) {
+        let raw_row = std::hint::black_box([10; BUFFER_SIZE]);
+        let mut decoded_row = std::hint::black_box([0; BUFFER_SIZE]);
+
+        b.iter(|| unsafe { sub_sse_prefix_sum_no_extract(&raw_row, &mut decoded_row) });
+
+        std::hint::black_box(decoded_row);
+    }
+
+    #[bench]
+    fn bench_sub_sse2_ported(b: &mut Bencher) {
+        let raw_row = std::hint::black_box([10; BUFFER_SIZE]);
+        let mut decoded_row = std::hint::black_box([0; BUFFER_SIZE]);
+
+        b.iter(|| unsafe { sub_sse2_ported(&raw_row, &mut decoded_row) });
+
+        std::hint::black_box(decoded_row);
     }
 }
 
