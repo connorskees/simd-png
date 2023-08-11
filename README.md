@@ -7,7 +7,8 @@ compilers; however, the `sub`, `average`, and `paeth` filters are sufficiently
 complex as to make it very unlikely for auto-vectorization to occur.
 
 By using a modified implementation of vectorized prefix-sum, we are able to decode
-the `sub` filter 32 bytes at a time for 8-bit RGBA pixels.
+the `sub` filter 16 bytes at a time for 8-bit RGBA pixels -- using the full width
+of the MMX registers, rather than being bound by the bytes-per-pixel.
 
 Based on benchmarks done on a dedicated Linux server, this implementation of the
 `sub` filter is around 20-25% faster than existing SSE4.1 implementations.
